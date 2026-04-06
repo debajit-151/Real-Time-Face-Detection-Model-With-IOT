@@ -3,3 +3,6 @@ deepface
 numpy
 pandas
 tf-keras
+torch
+torchvision
+customtkinter
