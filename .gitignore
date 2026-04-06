@@ -23,3 +23,6 @@ logs/
 *.pkl
 *.jpg
 *.h5
+
+# Test scripts
+test_*.py

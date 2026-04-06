@@ -6,3 +6,4 @@ tf-keras
 torch
 torchvision
 customtkinter
+pyserial
