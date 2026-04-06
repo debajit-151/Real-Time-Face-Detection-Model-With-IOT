@@ -9,9 +9,11 @@ from face_encoding import FaceEncoder
 from recognition import FaceRecognizer
 from add_person import register_new_person
 import logger
+import logging
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
+from deepface import DeepFace
 
 class FaceRecognitionApp:
     def __init__(self, root):
@@ -97,11 +99,27 @@ class FaceRecognitionApp:
             
             if frame_count % process_every_n_frames == 0:
                 current_faces = []
-                for (x, y, w, h) in faces:
-                    face_img = self.detector.extract_face(frame, (x, y, w, h))
-                    name = self.recognizer.identify(face_img)
-                    current_faces.append({"bbox": (x, y, w, h), "name": name})
-                    logger.log_recognition(name)
+                try:
+                    # Run DeepFace extraction with liveness detection
+                    df_faces = DeepFace.extract_faces(frame, anti_spoofing=True, enforce_detection=False)
+                    for face_obj in df_faces:
+                        if face_obj.get("confidence", 0) > 0.5:
+                            area = face_obj["facial_area"]
+                            x, y, w, h = area["x"], area["y"], area["w"], area["h"]
+                            
+                            is_real = face_obj.get("is_real", True)
+                            
+                            if is_real:
+                                face_bgr = self.detector.extract_face(frame, (x, y, w, h))
+                                name = self.recognizer.identify(face_bgr)
+                            else:
+                                name = "Spoof!"
+                                
+                            current_faces.append({"bbox": (x, y, w, h), "name": name})
+                            if name not in ["Unknown", "Spoof!"]:
+                                logger.log_recognition(name)
+                except Exception as e:
+                    pass
             else:
                 # If we skipped recognition, try to match current bounding boxes to the cached faces
                 # by simple spatial proximity (basic tracking). For simplicity, we just use the detection
@@ -121,8 +139,14 @@ class FaceRecognitionApp:
                         name_to_display = cf["name"]
                         break
                 
-                # Colors
-                color = (0, 255, 0) if name_to_display != "Unknown" and name_to_display != "Scanning..." else (0, 0, 255)
+                # Colors (BGR format in OpenCV)
+                if name_to_display == "Spoof!":
+                    color = (0, 0, 255) # Red for fake
+                    name_to_display = "SPOOF DETECTED!"
+                elif name_to_display not in ["Unknown", "Scanning..."]:
+                    color = (0, 255, 0) # Green for known live person
+                else:
+                    color = (255, 165, 0) if name_to_display == "Scanning..." else (0, 0, 255)
                 
                 cv2.rectangle(display_frame, (x, y), (x+w, y+h), color, 2)
                 cv2.putText(display_frame, name_to_display, (x, y-10), 
@@ -135,6 +159,7 @@ class FaceRecognitionApp:
                 
         cap.release()
         cv2.destroyAllWindows()
+        cv2.waitKey(1) # macOS fix for window cleanup
         
         # Show main window again
         self.root.deiconify()
