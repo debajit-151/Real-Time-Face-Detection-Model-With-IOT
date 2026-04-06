@@ -1,0 +1,25 @@
+# Environments
+venv/
+env/
+.env
+
+# Python / Compilation
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# MacOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+
+# Project Data
+dataset/
+data/
+logs/
+*.pkl
+*.jpg
+*.h5
