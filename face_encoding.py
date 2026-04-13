@@ -23,6 +23,7 @@ class FaceEncoder:
 
     def save_db(self):
         """Saves the embeddings database to disk"""
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         with open(DB_PATH, 'wb') as f:
             pickle.dump(self.db, f)
 

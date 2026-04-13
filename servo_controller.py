@@ -40,7 +40,7 @@ class ServoController:
 
         # Rate limiting: don't spam serial with TRACK commands
         self._last_track_time = 0
-        self._track_cooldown = 0.05      # 50ms minimum between track commands
+        self._track_cooldown = 0.08      # 80ms minimum between track commands
 
         # Reader thread
         self._reader_thread = None
@@ -48,6 +48,14 @@ class ServoController:
         # Callbacks (optional)
         self.on_motion = None            # Called with (bool) when motion status changes
         self.on_state_change = None      # Called with (str) when ESP state changes
+
+        # ── Toggle flags (controlled from UI) ────────────────
+        self.pir_enabled = True          # When False, MOTION messages are ignored
+        self.scanning_enabled = True     # When False, send_scan() is suppressed
+
+        # ── Exponential smoothing for tracking ───────────────
+        self._smoothed_angle = 90.0
+        self._smoothing_alpha = 0.30     # Blend factor: 0 = ignore new, 1 = snap instantly
 
     # ─── Connection ─────────────────────────────────────────
 
@@ -136,7 +144,14 @@ class ServoController:
         """Parse a line from the ESP32."""
         if line.startswith("MOTION:"):
             val = line.split(":")[1]
-            self.motion_detected = (val == "1")
+            new_state = (val == "1")
+
+            # Gate motion events through the pir_enabled flag
+            if not self.pir_enabled:
+                self.motion_detected = False
+                return
+
+            self.motion_detected = new_state
             if self.on_motion:
                 self.on_motion(self.motion_detected)
 
@@ -150,6 +165,10 @@ class ServoController:
             self.esp_state = line.split(":")[1]
             if self.on_state_change:
                 self.on_state_change(self.esp_state)
+
+        elif line.startswith("PIR:"):
+            # Acknowledgment from ESP32 (PIR:ON / PIR:OFF) — no action needed
+            pass
 
     # ─── Commands (Python → ESP32) ──────────────────────────
 
@@ -177,6 +196,8 @@ class ServoController:
         """Tell ESP32 to resume autonomous scanning."""
         if not self.connected:
             return
+        if not self.scanning_enabled:
+            return  # Scanning is disabled from UI
         try:
             self.serial_conn.write(b"SCAN\n")
         except serial.SerialException:
@@ -191,46 +212,104 @@ class ServoController:
         except serial.SerialException:
             self.connected = False
 
+    def send_pir_on(self):
+        """Tell ESP32 to enable PIR sensor."""
+        if not self.connected:
+            return
+        try:
+            self.serial_conn.write(b"PIR_ON\n")
+        except serial.SerialException:
+            self.connected = False
+
+    def send_pir_off(self):
+        """Tell ESP32 to disable PIR sensor."""
+        if not self.connected:
+            return
+        try:
+            self.serial_conn.write(b"PIR_OFF\n")
+        except serial.SerialException:
+            self.connected = False
+
+    # ─── UI Toggle Methods ──────────────────────────────────
+
+    def toggle_pir(self):
+        """Toggle PIR sensor on/off. Returns new state (True=ON)."""
+        self.pir_enabled = not self.pir_enabled
+        if self.pir_enabled:
+            self.send_pir_on()
+            print("[SERVO] PIR sensor enabled")
+        else:
+            self.motion_detected = False
+            self.send_pir_off()
+            print("[SERVO] PIR sensor disabled")
+        return self.pir_enabled
+
+    def toggle_scanning(self):
+        """Toggle autonomous scanning on/off. Returns new state (True=ON)."""
+        self.scanning_enabled = not self.scanning_enabled
+        if self.scanning_enabled:
+            self.send_scan()
+            print("[SERVO] Camera scanning enabled")
+        else:
+            self.send_stop()
+            print("[SERVO] Camera scanning disabled")
+        return self.scanning_enabled
+
     # ─── Face Position → Servo Angle Mapping ────────────────
 
-    @staticmethod
-    def face_center_to_angle(face_x, face_w, frame_width, current_angle,
-                              fov=60, dead_zone=30):
+    def compute_smoothed_angle(self, face_x, face_w, frame_width, dead_zone=30):
         """
-        Convert a face's horizontal center position in the frame to a servo angle.
-
-        Args:
-            face_x: X coordinate of the face bounding box (left edge)
-            face_w: Width of the face bounding box
-            frame_width: Total width of the camera frame in pixels
-            current_angle: The servo's current angle
-            fov: Horizontal field of view of the camera in degrees (default 60°)
-            dead_zone: Pixel dead zone in center of frame where no adjustment happens
-
-        Returns:
-            target_angle (int): The new desired servo angle
+        Convert a face's horizontal center position to a virtual servo angle.
+        
+        This uses an open-loop velocity (virtual joystick) method. It does NOT use
+        self.current_angle from the ESP32, as video-to-serial latency causes violent
+        feedback loops and overshoot ("sharp jerks"). Instead, it steps a virtual target 
+        based strictly on visual error.
         """
         face_center_x = face_x + face_w / 2
         frame_center_x = frame_width / 2
 
         offset_px = face_center_x - frame_center_x
 
-        # If face is within dead zone, don't move
+        if abs(offset_px) < dead_zone:
+            return int(self._smoothed_angle)
+
+        max_offset = frame_width / 2.0
+        
+        # Proportional velocity: farther from center = faster step
+        # Assuming 30fps, 2.0 deg/frame = 60 degrees per second (fast but stable)
+        step = (abs(offset_px) / max_offset) * 2.0
+        step = max(0.4, min(2.0, step))
+
+        if offset_px > 0:
+            self._smoothed_angle -= step
+        else:
+            self._smoothed_angle += step
+
+        self._smoothed_angle = max(30.0, min(150.0, self._smoothed_angle))
+
+        return int(self._smoothed_angle)
+
+    # ── Legacy static method kept for backward compatibility ──
+
+    @staticmethod
+    def face_center_to_angle(face_x, face_w, frame_width, current_angle,
+                              fov=60, dead_zone=30):
+        """
+        Convert a face's horizontal center position in the frame to a servo angle.
+        (Kept for backward compatibility — prefer compute_smoothed_angle instead.)
+        """
+        face_center_x = face_x + face_w / 2
+        frame_center_x = frame_width / 2
+
+        offset_px = face_center_x - frame_center_x
+
         if abs(offset_px) < dead_zone:
             return current_angle
 
-        # Convert pixel offset to angle offset
-        # Positive offset_px = face is to the RIGHT of center
-        # On a servo: increasing angle typically pans RIGHT
         degrees_per_pixel = fov / frame_width
         angle_offset = offset_px * degrees_per_pixel
 
-        # Invert if your servo is mounted the other way
-        # (uncomment the next line if tracking goes the wrong direction)
-        # angle_offset = -angle_offset
-
         target = current_angle + angle_offset
-
-        # Clamp
         target = max(30, min(150, int(target)))
         return target

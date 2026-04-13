@@ -15,6 +15,8 @@
  *    TRACK:<angle>   — Move servo to <angle> degrees (face tracking)
  *    SCAN            — Resume autonomous scanning sweep
  *    STOP            — Stop servo and go idle
+ *    PIR_ON          — Enable PIR sensor readings
+ *    PIR_OFF         — Disable PIR sensor readings
  *
  *  Messages FROM ESP32 → Python:
  *    MOTION:1        — PIR triggered (motion detected)
@@ -39,11 +41,17 @@
 #define SERVO_MAX_PULSE  2400     // Maximum pulse width (µs)
 
 // ─── Timing Configuration (milliseconds) ───────────────────
-#define SCAN_STEP_DELAY     25    // ms between 1° steps during scanning (lower = faster)
-#define TRACK_STEP_DELAY    10    // ms between 1° steps during tracking (faster for responsiveness)
+#define SCAN_STEP_DELAY     40    // ms between 1° steps during scanning (smoother sweep)
+#define TRACK_STEP_DELAY    15    // ms between steps during tracking
 #define PIR_TIMEOUT         10000 // ms of no motion before going IDLE
 #define ANGLE_REPORT_INTERVAL 200 // ms between ANGLE reports to Python
-#define PIR_DEBOUNCE_MS     300   // PIR debounce window
+#define PIR_DEBOUNCE_MS     2000  // PIR debounce window (prevent false triggers)
+
+// ─── Tracking Smoothness ───────────────────────────────────
+// Maximum degrees the servo can move per tracking step.
+// Larger values = faster but jerkier. Smaller = smoother.
+#define TRACK_MAX_STEP      2.0   // max degrees per step
+#define TRACK_MIN_STEP      0.3   // min degrees per step (prevents creeping)
 
 // ─── State Machine ─────────────────────────────────────────
 enum State {
@@ -57,9 +65,9 @@ State currentState = STATE_IDLE;
 // ─── Global Variables ──────────────────────────────────────
 Servo servo;
 
-float currentAngle = SERVO_CENTER;  // Use float for sub-degree smooth interpolation
-int   targetAngle  = SERVO_CENTER;
-int   scanDirection = 1;            // 1 = increasing angle, -1 = decreasing
+float currentAngle  = SERVO_CENTER;  // Actual servo position (float for sub-degree)
+int   targetAngle   = SERVO_CENTER;  // Desired target angle
+int   scanDirection = 1;             // 1 = increasing angle, -1 = decreasing
 
 unsigned long lastStepTime       = 0;
 unsigned long lastMotionTime     = 0;
@@ -68,6 +76,7 @@ unsigned long lastPIRTrigger     = 0;
 
 bool motionActive = false;
 bool prevPIRState = LOW;
+bool pirEnabled   = true;           // Can be toggled by Python via PIR_ON / PIR_OFF
 
 // ─── Serial Input Buffer ───────────────────────────────────
 String serialBuffer = "";
@@ -75,7 +84,6 @@ String serialBuffer = "";
 // ─── Function Declarations ─────────────────────────────────
 void handleSerialInput();
 void updateStateMachine();
-void moveServoSmooth(int stepDelay);
 void reportAngle();
 void setState(State newState);
 
@@ -112,41 +120,43 @@ void loop() {
   // 1. Read serial commands from Python
   handleSerialInput();
 
-  // 2. Read PIR sensor
-  bool pirReading = digitalRead(PIR_PIN);
+  // 2. Read PIR sensor (only if enabled)
+  if (pirEnabled) {
+    bool pirReading = digitalRead(PIR_PIN);
 
-  // Debounce PIR
-  if (pirReading == HIGH && prevPIRState == LOW) {
-    if (millis() - lastPIRTrigger > PIR_DEBOUNCE_MS) {
-      lastPIRTrigger = millis();
-      lastMotionTime = millis();
+    // Debounce PIR — only react to rising edges with a cooldown
+    if (pirReading == HIGH && prevPIRState == LOW) {
+      if (millis() - lastPIRTrigger > PIR_DEBOUNCE_MS) {
+        lastPIRTrigger = millis();
+        lastMotionTime = millis();
 
-      if (!motionActive) {
-        motionActive = true;
-        Serial.println("MOTION:1");
+        if (!motionActive) {
+          motionActive = true;
+          Serial.println("MOTION:1");
 
-        // If idle, start scanning
-        if (currentState == STATE_IDLE) {
-          setState(STATE_SCANNING);
+          // If idle, start scanning
+          if (currentState == STATE_IDLE) {
+            setState(STATE_SCANNING);
+          }
         }
       }
     }
-  }
-  prevPIRState = pirReading;
+    prevPIRState = pirReading;
 
-  // Keep motion timer alive while PIR reads HIGH
-  if (pirReading == HIGH) {
-    lastMotionTime = millis();
-  }
+    // Keep motion timer alive while PIR reads HIGH
+    if (pirReading == HIGH) {
+      lastMotionTime = millis();
+    }
 
-  // Check motion timeout
-  if (motionActive && (millis() - lastMotionTime > PIR_TIMEOUT)) {
-    motionActive = false;
-    Serial.println("MOTION:0");
+    // Check motion timeout
+    if (motionActive && (millis() - lastMotionTime > PIR_TIMEOUT)) {
+      motionActive = false;
+      Serial.println("MOTION:0");
 
-    // Only go idle if we're scanning (not tracking a face)
-    if (currentState == STATE_SCANNING) {
-      setState(STATE_IDLE);
+      // Only go idle if we're scanning (not tracking a face)
+      if (currentState == STATE_SCANNING) {
+        setState(STATE_IDLE);
+      }
     }
   }
 
@@ -184,6 +194,16 @@ void handleSerialInput() {
         else if (serialBuffer == "STOP") {
           setState(STATE_IDLE);
         }
+        else if (serialBuffer == "PIR_ON") {
+          pirEnabled = true;
+          Serial.println("PIR:ON");
+        }
+        else if (serialBuffer == "PIR_OFF") {
+          pirEnabled = false;
+          motionActive = false;
+          Serial.println("MOTION:0");
+          Serial.println("PIR:OFF");
+        }
       }
 
       serialBuffer = "";
@@ -204,9 +224,9 @@ void updateStateMachine() {
       break;
 
     case STATE_SCANNING: {
-      // Sweep left ↔ right smoothly
+      // Sweep left ↔ right smoothly, 1° at a time
       unsigned long now = millis();
-      if (now - lastStepTime >= SCAN_STEP_DELAY) {
+      if (now - lastStepTime >= (unsigned long)SCAN_STEP_DELAY) {
         lastStepTime = now;
 
         currentAngle += scanDirection;
@@ -226,19 +246,34 @@ void updateStateMachine() {
     }
 
     case STATE_TRACKING: {
-      // Smoothly move toward target angle (1° steps)
+      // Proportional smooth movement toward target angle.
+      // Step size is proportional to distance — big gap = faster move,
+      // small gap = tiny nudge. This eliminates jerkiness.
       unsigned long now = millis();
-      if (now - lastStepTime >= TRACK_STEP_DELAY) {
+      if (now - lastStepTime >= (unsigned long)TRACK_STEP_DELAY) {
         lastStepTime = now;
 
-        if ((int)currentAngle < targetAngle) {
-          currentAngle += 1.0;
-        } else if ((int)currentAngle > targetAngle) {
-          currentAngle -= 1.0;
+        float error = (float)targetAngle - currentAngle;
+        float absError = abs(error);
+
+        if (absError < TRACK_MIN_STEP) {
+          // Close enough — snap to target and stop moving
+          currentAngle = targetAngle;
+        } else {
+          // Proportional step: move 25% of remaining distance per tick,
+          // clamped between MIN_STEP and MAX_STEP
+          float step = absError * 0.25;
+          step = constrain(step, TRACK_MIN_STEP, TRACK_MAX_STEP);
+
+          if (error > 0) {
+            currentAngle += step;
+          } else {
+            currentAngle -= step;
+          }
         }
 
-        // Clamp
-        currentAngle = constrain(currentAngle, SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+        // Clamp to valid range
+        currentAngle = constrain(currentAngle, (float)SERVO_MIN_ANGLE, (float)SERVO_MAX_ANGLE);
         servo.write((int)currentAngle);
       }
       break;
